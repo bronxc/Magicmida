@@ -34,15 +34,10 @@ type
   private
     FProcess: TProcessInformation;
     FOEP, FIAT, FImageBase: NativeUInt;
-    FForwards: TForwardDict; // Key: NTDLL, Value: kernel32 (points to API)
+    FForwards: TForwardDict;
     FForwardsType2: TForwardDict; // Key: NTDLL, Value: user32 (points to fwd-string)
-    FForwardsOle32: TForwardDict; // Key: combase, Value: ole32
-    FForwardsNetapi32: TForwardDict; // Key: netutils, Value: netapi32
-    FForwardsCrypt32: TForwardDict; // Key: DPAPI, Value: crypt32
-    FForwardsDbghelp: TForwardDict; // Key: dbgcore, Value: dbghelp
-    FForwardsKernelbase: TForwardDict; // Key: NTDLL, Value: kernelbase (Win8 sync APIs like WakeByAddressAll)
-    FForwardsAdvapi32: TForwardDict; // Key: cryptbase, Value: advapi32
-    FForwardsSetupapi: TForwardDict; // Key: cfgmgr32, Value: setupapi
+    FForwardsKernelbase: TForwardDict; // Key: NTDLL, Value: kernelbase
+    FForwardsWsock: TForwardDict;
     FAllModules: TList<PRemoteModule>;
     FIATImage: PByte;
     FIATImageSize: Cardinal;
@@ -55,6 +50,7 @@ type
     procedure GatherModuleExportsFromRemoteProcess(M: PRemoteModule);
     procedure TakeModuleSnapshot;
     function GetLocalProcAddr(hModule: HMODULE; ProcName: PAnsiChar): Pointer;
+    function TargetHasModule(const Name: string): Boolean;
     function RPM(Address: NativeUInt; Buf: Pointer; BufSize: NativeUInt): Boolean;
   public
     constructor Create(const AProcess: TProcessInformation; AImageBase, AOEP: UIntPtr);
@@ -96,15 +92,10 @@ begin
     FHUsr := LoadLibraryEx(PChar(FUsrPath), 0, $20) - 2;
   end;
 
-  FForwards := TForwardDict.Create(32);
+  FForwards := TForwardDict.Create(256);
   FForwardsType2 := TForwardDict.Create(16);
-  FForwardsOle32 := TForwardDict.Create(32);
-  FForwardsNetapi32 := TForwardDict.Create(32);
-  FForwardsCrypt32 := TForwardDict.Create(16);
-  FForwardsDbghelp := TForwardDict.Create(16);
-  FForwardsKernelbase := TForwardDict.Create(16);
-  FForwardsAdvapi32 := TForwardDict.Create(16);
-  FForwardsSetupapi := TForwardDict.Create(16);
+  FForwardsKernelbase := TForwardDict.Create(32);
+  FForwardsWsock := TForwardDict.Create(16);
   CollectNTFwd;
 end;
 
@@ -114,13 +105,8 @@ var
 begin
   FForwards.Free;
   FForwardsType2.Free;
-  FForwardsOle32.Free;
-  FForwardsNetapi32.Free;
-  FForwardsCrypt32.Free;
-  FForwardsDbghelp.Free;
   FForwardsKernelbase.Free;
-  FForwardsAdvapi32.Free;
-  FForwardsSetupapi.Free;
+  FForwardsWsock.Free;
 
   if FAllModules <> nil then
   begin
@@ -146,43 +132,52 @@ end;
 
 procedure TDumper.CollectNTFwd;
 var
-  hNetapi, hSrvcli, hCrypt32, hDpapi, hDbghelp, hDbgcore, hSetupapi, hCfgmgr32: HMODULE;
+  hMain, hSecondary, hTertiary: HMODULE;
 begin
-  CollectForwards(FForwards, GetModuleHandle(kernel32), 0);
+  CollectForwards(FForwards, GetModuleHandle(kernel32), 0); // fwd to ntdll
   if FHUsr <> 0 then
     CollectForwards(FForwardsType2, GetModuleHandle(user32), FHUsr);
-  CollectForwards(FForwardsOle32, GetModuleHandle('ole32.dll'), 0);
-  CollectForwards(FForwardsAdvapi32, GetModuleHandle('advapi32.dll'), 0);
+  CollectForwards(FForwards, GetModuleHandle('ole32.dll'), 0); // fwd to combase
+  CollectForwards(FForwards, GetModuleHandle('advapi32.dll'), 0); // fwd to cryptbase
 
-  hNetapi := LoadLibrary('netapi32.dll');
-  hSrvcli := LoadLibrary('srvcli.dll'); // Required for CollectForwards
-  CollectForwards(FForwardsNetapi32, hNetapi, 0);
-  FreeLibrary(hSrvcli);
-  FreeLibrary(hNetapi);
+  hMain := LoadLibrary('netapi32.dll'); // fwd to netutils
+  hSecondary := LoadLibrary('srvcli.dll'); // Required for CollectForwards
+  hTertiary := LoadLibrary('samcli.dll'); // Required for CollectForwards
+  CollectForwards(FForwards, hMain, 0);
+  FreeLibrary(hTertiary);
+  FreeLibrary(hSecondary);
+  FreeLibrary(hMain);
 
   if Win32MajorVersion >= 6 then
   begin
-    hCrypt32 := LoadLibrary('crypt32.dll');
-    hDpapi := LoadLibrary('dpapi.dll'); // Required for CollectForwards
-    CollectForwards(FForwardsCrypt32, hCrypt32, 0);
-    FreeLibrary(hCrypt32);
-    FreeLibrary(hDpapi);
+    hMain := LoadLibrary('crypt32.dll'); // fwd to dpapi
+    hSecondary := LoadLibrary('dpapi.dll'); // Required for CollectForwards
+    CollectForwards(FForwards, hMain, 0);
+    FreeLibrary(hMain);
+    FreeLibrary(hSecondary);
   end;
 
-  hDbghelp := LoadLibrary('dbghelp.dll');
-  hDbgcore := LoadLibrary('dbgcore.dll'); // Required for CollectForwards
-  CollectForwards(FForwardsDbghelp, hDbghelp, 0);
-  FreeLibrary(hDbghelp);
-  FreeLibrary(hDbgcore);
+  hMain := LoadLibrary('dbghelp.dll'); // fwd to dbgcore
+  hSecondary := LoadLibrary('dbgcore.dll'); // Required for CollectForwards
+  CollectForwards(FForwards, hMain, 0);
+  FreeLibrary(hMain);
+  FreeLibrary(hSecondary);
 
-  hSetupapi := LoadLibrary('setupapi.dll');
-  hCfgmgr32 := LoadLibrary('cfgmgr32.dll'); // Required for CollectForwards
-  CollectForwards(FForwardsSetupapi, hSetupapi, 0);
-  FreeLibrary(hSetupapi);
-  FreeLibrary(hCfgmgr32);
+  hMain := LoadLibrary('setupapi.dll'); // fwd to cfgmgr32
+  hSecondary := LoadLibrary('cfgmgr32.dll'); // Required for CollectForwards
+  CollectForwards(FForwards, hMain, 0);
+  FreeLibrary(hMain);
+  FreeLibrary(hSecondary);
 
+  hMain := LoadLibrary('wsock32.dll'); // fwd to ws2_32
+  hSecondary := LoadLibrary('ws2_32.dll');
+  CollectForwards(FForwardsWsock, hMain, 0);
+  FreeLibrary(hMain);
+  FreeLibrary(hSecondary);
+
+  // This is separate because most are covered by kernel32
   if GetModuleHandle('kernelbase.dll') <> 0 then
-    CollectForwards(FForwardsKernelbase, GetModuleHandle('kernelbase.dll'), 0);
+    CollectForwards(FForwardsKernelbase, GetModuleHandle('kernelbase.dll'), 0); // fwd to ntdll
 end;
 
 procedure TDumper.CollectForwards(Fwds: TForwardDict; hModReal, hModScan: HMODULE);
@@ -347,22 +342,11 @@ begin
     end
     else
     begin
-      // Some kernel32 functions are forwarded to ntdll - restore the original address
       if FForwards.TryGetValue(a^, Fwd) then
-        a^ := Fwd
-      else if FForwardsOle32.TryGetValue(a^, Fwd) then
-        a^ := Fwd
-      else if FForwardsNetapi32.TryGetValue(a^, Fwd) then
-        a^ := Fwd
-      else if FForwardsCrypt32.TryGetValue(a^, Fwd) then
-        a^ := Fwd
-      else if FForwardsDbghelp.TryGetValue(a^, Fwd) then
         a^ := Fwd
       else if FForwardsKernelbase.TryGetValue(a^, Fwd) then
         a^ := Fwd
-      else if FForwardsAdvapi32.TryGetValue(a^, Fwd) then
-        a^ := Fwd
-      else if FForwardsSetupapi.TryGetValue(a^, Fwd) then
+      else if FForwardsWsock.TryGetValue(a^, Fwd) and TargetHasModule('wsock32.dll') then
         a^ := Fwd;
       RangeChecker := a^;
     end;
@@ -576,6 +560,16 @@ begin
     end;
   until not Module32Next(hSnap, ME);
   CloseHandle(hSnap);
+end;
+
+function TDumper.TargetHasModule(const Name: string): Boolean;
+var
+  RM: PRemoteModule;
+begin
+  for RM in FAllModules do
+    if RM.Name = Name then
+      Exit(True);
+  Result := False;
 end;
 
 function TDumper.RPM(Address: NativeUInt; Buf: Pointer; BufSize: NativeUInt): Boolean;
